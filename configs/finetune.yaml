@@ -1,0 +1,34 @@
+mllm_id: "google/gemma-2-2b-it"
+diffusion_model_id: "Efficient-Large-Model/Sana_1600M_512px_diffusers"
+vae_id: "Efficient-Large-Model/Sana_1600M_512px_diffusers"
+noise_scheduler_id: "Efficient-Large-Model/Sana_1600M_512px_diffusers"
+scheduler_id: "Efficient-Large-Model/Sana_1600M_512px_diffusers"
+
+vae_downsample_f: 32
+in_channels: 32
+system_prompt: "You are a robot and should focus on your actions. Generate a new image that meets the user's instruction while maintaining consistency with the original input where appropriate."
+_gradient_checkpointing: False
+modules_to_freeze:
+  - "vae"
+  - "mllm_backbone"
+
+# Please specify the path to the data
+data_path: path/to/data
+camera_key: "observation.images.head_left_rgb"
+target_image_size: [480, 640]
+
+per_device_train_batch_size: 4
+learning_rate: 0.00001
+save_steps: 1000
+warmup_steps: 0
+num_train_epochs: 5.0
+lr_scheduler_type: "constant_with_warmup"
+report_to: "wandb"
+
+deepspeed: "configs/zero1.json"
+
+# Please specify the path to the output
+output_dir: path/to/output
+
+# Please specify the path to the pretrained checkpoint
+resume_from_checkpoint: path/to/pretrained_checkpoint
