@@ -16,7 +16,7 @@
 
 ## Demo
 
-[![Watch the video](assets/demo-first-frame.png)](https://www.youtube.com/watch?v=VJ72RbSur0Q)
+[![Watch the video](assets/demo-first-frame.png)](https://www.youtube.com/watch?v=D7fZT01Kd1A)
 
 ## Usage
 
