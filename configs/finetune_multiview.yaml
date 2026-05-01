@@ -18,6 +18,12 @@ views:
   - name: primary
     key: "observation.images.head_left_rgb"
     size: [480, 640]
+  - name: wrist_left
+    key: "observation.images.left_wrist_rgb"
+    size: [256, 320]
+  - name: wrist_right
+    key: "observation.images.right_wrist_rgb"
+    size: [256, 320]
 
 dataloader_num_workers: 16
 dataloader_persistent_workers: true

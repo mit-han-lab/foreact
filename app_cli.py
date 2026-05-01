@@ -14,7 +14,7 @@ def process(
     pipeline,
     prompt,
     output_dir,
-    input_image_path=None,
+    input_image_paths=None,
     negative_prompt="",
     seed=None,
     guidance_scale=4.5,
@@ -22,9 +22,8 @@ def process(
     num_inference_steps=8,
     num_images_per_prompt=1,
 ):
-    """Generate images using the VisualForesight pipeline"""
+    """Generate images (one per view) using the VisualForesight pipeline."""
 
-    # Set random seed
     if seed is None:
         seed = random.randint(0, np.iinfo(np.int32).max)
 
@@ -38,16 +37,16 @@ def process(
     if negative_prompt:
         print(f"Negative prompt: {negative_prompt}")
 
-    # Load input image if provided
-    input_image = None
-    if input_image_path:
-        input_image = Image.open(input_image_path).convert('RGB')
-        print(f"Loaded input image: {input_image_path}")
+    input_images = {}
+    if input_image_paths:
+        for view_name, path in input_image_paths.items():
+            if path:
+                input_images[view_name] = Image.open(path).convert("RGB")
+                print(f"Loaded input image for view '{view_name}': {path}")
 
-    # Generate images
     print("\nGenerating...")
-    images = pipeline(
-        image=input_image,
+    per_view_images = pipeline(
+        images=input_images if input_images else None,
         caption=prompt,
         negative_prompt=negative_prompt,
         guidance_scale=guidance_scale,
@@ -58,19 +57,19 @@ def process(
         enable_progress_bar=True,
     ).images
 
-    # Save generated images
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     saved_paths = []
 
-    for idx, img in enumerate(images):
-        filename = f"generated_{timestamp}_seed{seed}_{idx}.png"
-        filepath = os.path.join(output_dir, filename)
-        img.save(filepath)
-        saved_paths.append(filepath)
-        print(f"Saved: {filepath}")
+    for view_name, images in per_view_images.items():
+        for idx, img in enumerate(images):
+            filename = f"generated_{timestamp}_seed{seed}_{view_name}_{idx}.png"
+            filepath = os.path.join(output_dir, filename)
+            img.save(filepath)
+            saved_paths.append(filepath)
+            print(f"Saved: {filepath}")
 
-    print(f"\nGenerated {len(saved_paths)} image(s)")
+    print(f"\nGenerated {len(saved_paths)} image(s) across {len(per_view_images)} view(s)")
     return saved_paths
 
 
@@ -97,9 +96,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--input_image",
-        type=str,
-        default=None,
-        help="Path to input image"
+        nargs="+",
+        default=[],
+        metavar="NAME=PATH",
+        help="Per-view input image(s) as NAME=PATH, space-separated. e.g. "
+             "`--input_image primary=foo.png wrist_left=bar.png wrist_right=baz.png`. "
+             "For a single-view checkpoint just pass `--input_image primary=foo.png`."
     )
     parser.add_argument(
         "--negative_prompt",
@@ -129,7 +131,7 @@ if __name__ == "__main__":
         "--num_inference_steps",
         type=int,
         default=8,
-        help="Number of inference steps (default: 30)"
+        help="Number of inference steps (default: 8)"
     )
     parser.add_argument(
         "--num_images_per_prompt",
@@ -150,11 +152,25 @@ if __name__ == "__main__":
     pipeline = pipeline.to(device="cuda", dtype=torch.bfloat16)
     print("Model loaded successfully!\n")
 
+    view_names = list(pipeline.config.view_names)
+    print(f"Loaded checkpoint with {len(view_names)} view(s): {view_names}")
+
+    input_image_paths = {}
+    for kv in args.input_image:
+        if "=" not in kv:
+            parser.error(f"--input_image expects NAME=PATH, got: {kv!r}")
+        name, path = kv.split("=", 1)
+        if name not in view_names:
+            parser.error(
+                f"Unknown view '{name}' in --input_image; checkpoint exposes {view_names}"
+            )
+        input_image_paths[name] = path
+
     process(
         pipeline=pipeline,
         prompt=args.prompt,
         output_dir=args.output_dir,
-        input_image_path=args.input_image,
+        input_image_paths=input_image_paths if input_image_paths else None,
         negative_prompt=args.negative_prompt,
         seed=args.seed,
         guidance_scale=args.guidance_scale,

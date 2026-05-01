@@ -8,6 +8,7 @@ import PIL.Image
 
 from accelerate.utils import release_memory
 from dataclasses import dataclass, field
+from typing import List
 from transformers import Trainer
 from transformers.trainer_utils import get_last_checkpoint
 from PIL import PngImagePlugin
@@ -52,8 +53,11 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = "data/realworld"
-    camera_key: str = "observation.images.head_left_rgb"
-    target_image_size: tuple[int, int] = (480, 640)
+    views: List[dict] = field(
+        default_factory=lambda: [
+            {"name": "primary", "key": "observation.images.head_left_rgb", "size": [480, 640]},
+        ]
+    )
 
 
 @dataclass
@@ -109,10 +113,16 @@ if __name__ == "__main__":
     _, model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     model_args, data_args = possible_override_args(override_args, model_args, data_args)
 
-    assert (
-        data_args.target_image_size[0] % model_args.vae_downsample_f == 0 and data_args.target_image_size[1] % model_args.vae_downsample_f == 0
-    ), f"Image size must be divisible by {model_args.vae_downsample_f}"
-    input_size = (data_args.target_image_size[0] // model_args.vae_downsample_f, data_args.target_image_size[1] // model_args.vae_downsample_f)
+    view_names = [v["name"] for v in data_args.views]
+    view_latent_sizes = []
+    f = model_args.vae_downsample_f
+    for v in data_args.views:
+        h, w = v["size"]
+        assert (
+            h % f == 0 and w % f == 0
+        ), f"View {v['name']} size {v['size']} must be divisible by {f}"
+        view_latent_sizes.append((h // f, w // f))
+    input_size = view_latent_sizes[0]
 
     if training_args.resume_from_checkpoint is not None:
         training_args.resume_from_checkpoint = find_newest_checkpoint(
@@ -121,6 +131,8 @@ if __name__ == "__main__":
         model = VisualForesight.from_pretrained(
             training_args.resume_from_checkpoint,
             input_size=input_size,
+            view_names=view_names,
+            view_latent_sizes=view_latent_sizes,
             ignore_mismatched_sizes=True,
             **model_args.__dict__,
         )
@@ -128,6 +140,8 @@ if __name__ == "__main__":
         model = VisualForesight(
             config=VisualForesightConfig(
                 input_size=input_size,
+                view_names=view_names,
+                view_latent_sizes=view_latent_sizes,
                 **model_args.__dict__,
             ),
         )

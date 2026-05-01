@@ -23,29 +23,49 @@ def randomize_seed_fn(seed, randomize_seed):
     return seed
 
 
-def process(
-    prompt,
-    negative_prompt,
-    seed,
-    guidance_scale,
-    image_guidance_scale,
-    num_inference_steps,
-    num_images_per_prompt,
-    input_image,
-    progress=gr.Progress(track_tqdm=True),
-):
-    images = pipeline(
-        image=input_image,
-        caption=prompt,
-        negative_prompt=negative_prompt,
-        guidance_scale=guidance_scale,
-        image_guidance_scale=image_guidance_scale,
-        num_inference_steps=num_inference_steps,
-        num_images_per_prompt=num_images_per_prompt,
-        generator=torch.Generator().manual_seed(seed),
-        enable_progress_bar=True,
-    ).images
-    return images
+def make_process_fn(pipeline, view_names):
+    n_meta = 7  # prompt, negative_prompt, seed, gs, igs, n_steps, n_images
+
+    def process(*all_args, progress=gr.Progress(track_tqdm=True)):
+        (
+            prompt,
+            negative_prompt,
+            seed,
+            guidance_scale,
+            image_guidance_scale,
+            num_inference_steps,
+            num_images_per_prompt,
+        ) = all_args[:n_meta]
+        view_images = all_args[n_meta:]
+
+        input_images = {
+            name: img
+            for name, img in zip(view_names, view_images)
+            if img is not None
+        }
+
+        per_view_outputs = pipeline(
+            images=input_images if input_images else None,
+            caption=prompt,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            image_guidance_scale=image_guidance_scale,
+            num_inference_steps=num_inference_steps,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=torch.Generator().manual_seed(seed),
+            enable_progress_bar=True,
+        ).images
+
+        # Gradio convention: with a single output component, return the raw
+        # value (returning a 1-tuple would be passed through to the Gallery
+        # as-is, breaking its postprocess). With multiple components, return
+        # a tuple so Gradio dispatches per-component.
+        view_outputs = [per_view_outputs.get(name, []) for name in view_names]
+        if len(view_outputs) == 1:
+            return view_outputs[0]
+        return tuple(view_outputs)
+
+    return process
 
 
 if __name__ == "__main__":
@@ -65,23 +85,30 @@ if __name__ == "__main__":
 
     pipeline = pipeline.to(device="cuda", dtype=torch.bfloat16)
 
+    # Drive the UI from the loaded checkpoint's view configuration. Old
+    # single-view checkpoints (no `view_names` field) fall back to the config
+    # default ("primary",) and render a 1-panel UI; multi-view checkpoints
+    # render one input/output per configured view.
+    view_names = list(pipeline.config.view_names)
+    print(f"Loaded checkpoint with {len(view_names)} view(s): {view_names}")
+
     css = """
-    #output-gallery .grid-wrap {
-        max-height: 480px !important;
+    .gallery-view .grid-wrap {
+        max-height: 320px !important;
         overflow: hidden !important;
     }
-    #output-gallery .thumbnail-item {
-        max-height: 460px !important;
+    .gallery-view .thumbnail-item {
+        max-height: 300px !important;
     }
-    #output-gallery .thumbnail-item img {
-        max-height: 450px !important;
+    .gallery-view .thumbnail-item img {
+        max-height: 290px !important;
         object-fit: contain !important;
     }
     .gr-block { border-radius: 12px !important; }
     """
 
     with gr.Blocks(fill_width=True, css=css, title="VisualForesight") as demo:
-        gr.Markdown("# VisualForesight", elem_id="title")
+        gr.Markdown(f"# VisualForesight ({len(view_names)}-view)", elem_id="title")
 
         # Prompt row — full width
         with gr.Row():
@@ -93,18 +120,22 @@ if __name__ == "__main__":
             )
             generate_btn = gr.Button("Generate", variant="primary", scale=1, min_width=120)
 
-        # Input / Output side by side — equal columns
+        input_components = []
         with gr.Row(equal_height=True):
-            with gr.Column():
-                input_image = gr.Image(label="Input Image", type="pil", height=480)
-            with gr.Column():
-                output_gallery = gr.Gallery(
-                    columns=1,
-                    label="Generated Images",
-                    elem_id="output-gallery",
-                    height=480,
-                    object_fit="contain",
-                    preview=False,
+            for name in view_names:
+                input_components.append(
+                    gr.Image(label=f"{name} Input", type="pil", height=320)
+                )
+
+        output_components = []
+        with gr.Row(equal_height=True):
+            for name in view_names:
+                output_components.append(
+                    gr.Gallery(
+                        columns=1, label=f"{name} Output",
+                        elem_classes=["gallery-view"],
+                        height=320, object_fit="contain", preview=False,
+                    )
                 )
 
         # Settings row
@@ -148,8 +179,11 @@ if __name__ == "__main__":
             image_guidance_scale,
             num_inference_steps,
             num_images_per_prompt,
-            input_image,
+            *input_components,
         ]
+        outputs = output_components
+
+        process_fn = make_process_fn(pipeline, view_names)
 
         prompt.submit(
             fn=randomize_seed_fn,
@@ -157,9 +191,9 @@ if __name__ == "__main__":
             outputs=seed,
             api_name=False,
         ).then(
-            fn=process,
+            fn=process_fn,
             inputs=inputs,
-            outputs=output_gallery,
+            outputs=outputs,
         )
 
         generate_btn.click(
@@ -168,9 +202,9 @@ if __name__ == "__main__":
             outputs=seed,
             api_name=False,
         ).then(
-            fn=process,
+            fn=process_fn,
             inputs=inputs,
-            outputs=output_gallery,
+            outputs=outputs,
         )
 
         demo.launch(share=True)

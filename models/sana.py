@@ -236,8 +236,7 @@ class SanaTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.LongTensor] = None,
-        height: int = None,
-        width: int = None,
+        view_shapes: Optional[Tuple[Tuple[int, int], ...]] = None,
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
 
@@ -263,15 +262,21 @@ class SanaTransformerBlock(nn.Module):
             )
             hidden_states = attn_output + hidden_states
 
-        # 4. Feed-forward
+        # 4. Feed-forward. The GLUMBConv is a 2D depthwise conv, so each
+        # view-role chunk must be reshaped back to its own spatial grid and
+        # processed independently. The same conv weights are reused for every
+        # chunk so a single-view pretrained checkpoint loads unchanged.
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
-        norm_hidden_states = torch.cat(norm_hidden_states.chunk(2, dim=1), dim=0)
-        norm_hidden_states = norm_hidden_states.unflatten(1, (height, width)).permute(0, 3, 1, 2)
-        ff_output = self.ff(norm_hidden_states)
-        ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)
-        ff_output = torch.cat(ff_output.chunk(2, dim=0), dim=1)
+        sizes = [h * w for h, w in view_shapes]
+        chunks = torch.split(norm_hidden_states, sizes, dim=1)
+        ff_chunks = []
+        for chunk, (h, w) in zip(chunks, view_shapes):
+            spatial = chunk.unflatten(1, (h, w)).permute(0, 3, 1, 2)
+            out = self.ff(spatial).flatten(2, 3).permute(0, 2, 1)
+            ff_chunks.append(out)
+        ff_output = torch.cat(ff_chunks, dim=1)
         hidden_states = hidden_states + gate_mlp * ff_output
 
         return hidden_states
@@ -464,10 +469,12 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        source_hidden_states: torch.Tensor,
+        hidden_states,
+        source_hidden_states,
         encoder_hidden_states: torch.Tensor,
         timestep: torch.Tensor,
+        view_ids: Optional[Tuple[int, ...]] = None,
+        view_embedding: Optional[nn.Embedding] = None,
         guidance: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -475,6 +482,20 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         controlnet_block_samples: Optional[Tuple[torch.Tensor]] = None,
         return_dict: bool = True,
     ) -> Union[Tuple[torch.Tensor, ...], Transformer2DModelOutput]:
+        # `hidden_states` / `source_hidden_states` are lists of per-view latent
+        # tensors: [[B, C, H_v, W_v], ...]. A plain tensor is accepted for
+        # single-view callers and wrapped into a one-element list.
+        if torch.is_tensor(hidden_states):
+            hidden_states = [hidden_states]
+        if torch.is_tensor(source_hidden_states):
+            source_hidden_states = [source_hidden_states]
+        num_views = len(hidden_states)
+        assert len(source_hidden_states) == num_views, (
+            f"source/target view count mismatch: {len(source_hidden_states)} vs {num_views}"
+        )
+        if view_ids is None:
+            view_ids = tuple(range(num_views))
+
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
@@ -489,6 +510,10 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                 logger.warning(
                     "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
                 )
+
+        batch_size = hidden_states[0].shape[0]
+        ref_dtype = hidden_states[0].dtype
+        p = self.config.patch_size
 
         # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
         #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
@@ -505,83 +530,113 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             #   (1 = keep,      0 = discard)
             # convert mask into a bias that can be added to attention scores:
             #       (keep = +0,     discard = -10000.0)
-            attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
+            attention_mask = (1 - attention_mask.to(ref_dtype)) * -10000.0
             attention_mask = attention_mask.unsqueeze(1)
 
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+            encoder_attention_mask = (1 - encoder_attention_mask.to(ref_dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-        # 1. Input
-        batch_size, num_channels, height, width = hidden_states.shape
-        p = self.config.patch_size
-        post_patch_height, post_patch_width = height // p, width // p
+        # 1. Per-view patch embedding + view-id embedding.
+        view_shapes: list = []  # (H, W) per chunk, target chunks first then source
+        target_patches = []
+        source_patches = []
+        for v_idx, (tgt_latent, src_latent) in enumerate(zip(hidden_states, source_hidden_states)):
+            _, _, h, w = tgt_latent.shape
+            post_h, post_w = h // p, w // p
+            view_shapes.append((post_h, post_w))
 
-        hidden_states = self.patch_embed(hidden_states)
-        source_hidden_states = self.patch_embed(source_hidden_states)
-        hidden_states = torch.cat([hidden_states, source_hidden_states], dim=1)
+            tgt = self.patch_embed(tgt_latent)
+            src = self.patch_embed(src_latent)
+
+            if view_embedding is not None:
+                vid = torch.tensor([view_ids[v_idx]], device=tgt.device, dtype=torch.long)
+                vemb = view_embedding(vid).to(tgt.dtype)  # [1, dim]
+                tgt = tgt + vemb
+                src = src + vemb
+
+            target_patches.append(tgt)
+            source_patches.append(src)
+
+        # Order: all target views, then all source views.
+        target_cat = torch.cat(target_patches, dim=1)
+        source_cat = torch.cat(source_patches, dim=1)
+        target_sizes = list(view_shapes)
+        source_sizes = list(view_shapes)
+        view_shapes = target_sizes + source_sizes
+
+        hidden_cat = torch.cat([target_cat, source_cat], dim=1)
 
         if guidance is not None:
             timestep, embedded_timestep = self.time_embed(
-                timestep, guidance=guidance, hidden_dtype=hidden_states.dtype
+                timestep, guidance=guidance, hidden_dtype=hidden_cat.dtype
             )
         else:
             timestep, embedded_timestep = self.time_embed(
-                timestep, batch_size=batch_size, hidden_dtype=hidden_states.dtype
+                timestep, batch_size=batch_size, hidden_dtype=hidden_cat.dtype
             )
 
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_cat.shape[-1])
 
         encoder_hidden_states = self.caption_norm(encoder_hidden_states)
 
         # 2. Transformer blocks
+        view_shapes_tuple = tuple(view_shapes)
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for index_block, block in enumerate(self.transformer_blocks):
-                hidden_states = self._gradient_checkpointing_func(
+                hidden_cat = self._gradient_checkpointing_func(
                     block,
-                    hidden_states,
+                    hidden_cat,
                     attention_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
                     timestep,
-                    post_patch_height,
-                    post_patch_width,
+                    view_shapes_tuple,
                 )
                 if controlnet_block_samples is not None and 0 < index_block <= len(controlnet_block_samples):
-                    hidden_states = hidden_states + controlnet_block_samples[index_block - 1]
+                    hidden_cat = hidden_cat + controlnet_block_samples[index_block - 1]
 
         else:
             for index_block, block in enumerate(self.transformer_blocks):
-                hidden_states = block(
-                    hidden_states,
+                hidden_cat = block(
+                    hidden_cat,
                     attention_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
                     timestep,
-                    post_patch_height,
-                    post_patch_width,
+                    view_shapes_tuple,
                 )
                 if controlnet_block_samples is not None and 0 < index_block <= len(controlnet_block_samples):
-                    hidden_states = hidden_states + controlnet_block_samples[index_block - 1]
+                    hidden_cat = hidden_cat + controlnet_block_samples[index_block - 1]
 
-        hidden_states = hidden_states.chunk(2, dim=1)[0]
-        # 3. Normalization
-        hidden_states = self.norm_out(hidden_states, embedded_timestep, self.scale_shift_table)
+        # Keep the target half only (first sum(target_sizes) tokens).
+        target_len = sum(h * w for h, w in target_sizes)
+        hidden_cat = hidden_cat[:, :target_len, :]
 
-        hidden_states = self.proj_out(hidden_states)
+        # 3. Normalization + projection (spatially invariant).
+        hidden_cat = self.norm_out(hidden_cat, embedded_timestep, self.scale_shift_table)
+        hidden_cat = self.proj_out(hidden_cat)
 
-        # 5. Unpatchify
-        hidden_states = hidden_states.reshape(
-            batch_size, post_patch_height, post_patch_width, self.config.patch_size, self.config.patch_size, -1
-        )
-        hidden_states = hidden_states.permute(0, 5, 1, 3, 2, 4)
-        output = hidden_states.reshape(batch_size, -1, post_patch_height * p, post_patch_width * p)
+        # 4. Split per view and unpatchify each.
+        target_token_counts = [h * w for h, w in target_sizes]
+        per_view_tokens = torch.split(hidden_cat, target_token_counts, dim=1)
+        outputs = []
+        for tokens, (post_h, post_w) in zip(per_view_tokens, target_sizes):
+            reshaped = tokens.reshape(batch_size, post_h, post_w, p, p, -1)
+            reshaped = reshaped.permute(0, 5, 1, 3, 2, 4)
+            outputs.append(
+                reshaped.reshape(batch_size, -1, post_h * p, post_w * p)
+            )
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
+
+        # Preserve single-tensor output when only one view is passed, so
+        # existing callers / checkpoints that expect a tensor still work.
+        output = outputs[0] if num_views == 1 else outputs
 
         if not return_dict:
             return (output,)

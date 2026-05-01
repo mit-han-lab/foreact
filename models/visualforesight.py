@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import PIL
 import torch
@@ -38,6 +39,8 @@ class VisualForesightConfig(PretrainedConfig):
         vae_downsample_f: int = 32,
         input_size: tuple[int, int] = (15, 20),
         in_channels: int = 32,
+        view_names: Optional[tuple] = None,
+        view_latent_sizes: Optional[tuple] = None,
         system_prompt: str = "You are a robot and should focus on your actions. Generate a new image that meets the user's instruction while maintaining consistency with the original input where appropriate.",
         _gradient_checkpointing: bool = True,
         modules_to_freeze: tuple[str] = (),
@@ -53,9 +56,22 @@ class VisualForesightConfig(PretrainedConfig):
 
         self.max_input_text_tokens = max_input_text_tokens
         self.vae_downsample_f = vae_downsample_f
-        self.input_size = input_size
+        self.input_size = tuple(input_size)
         self.in_channels = in_channels
         self.system_prompt = system_prompt
+
+        # Backward compat: older checkpoints have neither field; treat as a
+        # single-view "primary" model whose latent size is `input_size`.
+        if view_names is None:
+            view_names = ("primary",)
+        if view_latent_sizes is None:
+            view_latent_sizes = (self.input_size,)
+        self.view_names = tuple(view_names)
+        self.view_latent_sizes = tuple(tuple(s) for s in view_latent_sizes)
+        assert len(self.view_names) == len(self.view_latent_sizes), (
+            f"view_names ({len(self.view_names)}) and view_latent_sizes "
+            f"({len(self.view_latent_sizes)}) must match."
+        )
 
         self._gradient_checkpointing = _gradient_checkpointing
         self.modules_to_freeze = modules_to_freeze
@@ -104,6 +120,23 @@ class VisualForesight(PreTrainedModel):
             config.scheduler_id, subfolder="scheduler"
         )
 
+        # --- View-id embedding ---
+        # Only create when there is more than one view: a single-view model
+        # has nothing to disambiguate, and skipping the param keeps SV
+        # checkpoints free of any view-related state (so loading a legacy SV
+        # checkpoint produces no "newly initialized" warning).
+        # Zero-init when present so a pretrained MV-architecture checkpoint
+        # with this param missing produces byte-identical outputs at step 0.
+        self.view_names = list(config.view_names)
+        self.view_to_id = {name: i for i, name in enumerate(self.view_names)}
+        if len(self.view_names) > 1:
+            t_cfg = self.transformer.config
+            inner_dim = t_cfg.num_attention_heads * t_cfg.attention_head_dim
+            self.view_embedding = nn.Embedding(len(self.view_names), inner_dim)
+            self.view_embedding.weight.data.zero_()
+        else:
+            self.view_embedding = None
+
         # --- Gradient checkpointing ---
         if config._gradient_checkpointing:
             try:
@@ -120,6 +153,14 @@ class VisualForesight(PreTrainedModel):
 
         for module_name in config.modules_to_unfreeze:
             self._set_module_requires_grad(module_name, True)
+
+    def _init_weights(self, module):
+        # Called by HuggingFace from_pretrained's _fast_init for every module
+        # whose weights are missing from the checkpoint. Submodules owned by
+        # mllm_backbone / transformer / vae manage their own init; we only
+        # need to handle our new view_embedding.
+        if isinstance(module, nn.Embedding) and module is self.view_embedding:
+            module.weight.data.zero_()
 
     def _set_module_requires_grad(self, module_name: str, requires_grad: bool):
         """Resolve a dotted module name and set requires_grad."""
@@ -178,19 +219,28 @@ class VisualForesight(PreTrainedModel):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    def forward(
-        self, source, target, input_ids=None, attention_mask=None, **kwargs
-    ):
-        latents = self.vae.encode(target).latent
-        source_latents = self.vae.encode(source).latent
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        # Collect per-view source/target image tensors from the flattened
+        # collate output (`source_{view}`, `target_{view}`) in the order the
+        # model was configured with.
+        source_views = [kwargs.pop(f"source_{n}") for n in self.view_names]
+        target_views = [kwargs.pop(f"target_{n}") for n in self.view_names]
 
-        latents = latents * self.vae.config.scaling_factor
-        source_latents = source_latents * self.vae.config.scaling_factor
+        # VAE-encode each view independently. Weights are shared; the VAE is
+        # fully convolutional so different H/W per view is fine.
+        target_latents_list = [
+            self.vae.encode(t).latent * self.vae.config.scaling_factor
+            for t in target_views
+        ]
+        source_latents_list = [
+            self.vae.encode(s).latent * self.vae.config.scaling_factor
+            for s in source_views
+        ]
 
-        bsz = latents.shape[0]
+        bsz = target_latents_list[0].shape[0]
+        device = target_latents_list[0].device
 
-        noise = torch.randn_like(latents, device=latents.device)
-
+        # One shared timestep per batch element, independent noise per view.
         weighting_scheme = "uniform"
         u = compute_density_for_timestep_sampling(
             weighting_scheme=weighting_scheme,
@@ -200,40 +250,55 @@ class VisualForesight(PreTrainedModel):
             mode_scale=1.29,
         )
         indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
-        timesteps = self.noise_scheduler.timesteps[indices].to(
-            device=latents.device
-        )
+        timesteps = self.noise_scheduler.timesteps[indices].to(device=device)
 
-        sigmas = self.get_sigmas(
-            timesteps, latents.device, n_dim=latents.ndim, dtype=latents.dtype
-        )
-        noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+        noisy_latents_list = []
+        noise_list = []
+        sigmas_list = []
+        for lat in target_latents_list:
+            noise = torch.randn_like(lat, device=lat.device)
+            sigmas = self.get_sigmas(
+                timesteps, lat.device, n_dim=lat.ndim, dtype=lat.dtype
+            )
+            noisy_latents_list.append((1.0 - sigmas) * lat + sigmas * noise)
+            noise_list.append(noise)
+            sigmas_list.append(sigmas)
 
         prompt_embeds, attention_mask = self.encode_condition(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
-        model_pred = self.transformer(
-            hidden_states=noisy_latents,
-            source_hidden_states=source_latents,
+        preds = self.transformer(
+            hidden_states=noisy_latents_list,
+            source_hidden_states=source_latents_list,
+            view_ids=[self.view_to_id[n] for n in self.view_names],
+            view_embedding=self.view_embedding,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
             encoder_attention_mask=attention_mask,
         ).sample
+        if torch.is_tensor(preds):
+            preds = [preds]
 
-        target = noise - latents
-        weighting = compute_loss_weighting_for_sd3(
-            weighting_scheme=weighting_scheme, sigmas=sigmas
-        )
-        loss = torch.mean(
-            (
-                weighting.float() * (model_pred.float() - target.float()) ** 2
-            ).reshape(target.shape[0], -1),
-            1,
-        )
-        loss = loss.mean()
+        # Per-view flow-matching loss, averaged across views.
+        per_view_losses = []
+        for pred, tgt_lat, noise, sigmas in zip(
+            preds, target_latents_list, noise_list, sigmas_list
+        ):
+            fm_target = noise - tgt_lat
+            weighting = compute_loss_weighting_for_sd3(
+                weighting_scheme=weighting_scheme, sigmas=sigmas
+            )
+            view_loss = torch.mean(
+                (
+                    weighting.float() * (pred.float() - fm_target.float()) ** 2
+                ).reshape(fm_target.shape[0], -1),
+                1,
+            )
+            per_view_losses.append(view_loss.mean())
 
+        loss = torch.stack(per_view_losses).mean()
         return {"loss": loss}
 
     @torch.no_grad()
@@ -253,7 +318,7 @@ class VisualForesight(PreTrainedModel):
     def sample_images(
         self,
         caption: str = "",
-        input_image: PIL.Image.Image = None,
+        input_images: Optional[dict] = None,
         guidance_scale: float = 3.0,
         image_guidance_scale: float = 1.5,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -265,10 +330,26 @@ class VisualForesight(PreTrainedModel):
         **kwargs,
     ):
         device = next(self.parameters()).device
-        latent_size = self.config.input_size
-        do_image_cfg = input_image is not None and image_guidance_scale > 1.0
+        view_latent_sizes = list(self.config.view_latent_sizes)
+        f = self.config.vae_downsample_f
 
-        # --- Text conditioning (with classifier-free guidance) ---
+        if input_images is None:
+            input_images = {}
+        # Fill missing views with blank images so image CFG still has a
+        # well-defined "null" branch even when the caller only provides some.
+        per_view_pil = {}
+        for name, latent_size in zip(self.view_names, view_latent_sizes):
+            img = input_images.get(name)
+            if img is None:
+                img = PIL.Image.new(
+                    "RGB",
+                    (latent_size[1] * f, latent_size[0] * f),
+                )
+            per_view_pil[name] = img
+
+        any_real_image = any(input_images.get(n) is not None for n in self.view_names)
+        do_image_cfg = any_real_image and image_guidance_scale > 1.0
+
         if do_image_cfg:
             captions = [negative_prompt, negative_prompt, caption]
         else:
@@ -281,66 +362,94 @@ class VisualForesight(PreTrainedModel):
             input_ids=input_ids, attention_mask=attention_mask,
         )
 
-        # --- Source image → VAE latents ---
-        source_transform = v2.Compose([
-            v2.Resize((latent_size[0] * self.config.vae_downsample_f,
-                        latent_size[1] * self.config.vae_downsample_f)),
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize([0.5], [0.5]),
-        ])
-        source = source_transform(input_image).unsqueeze(0).to(device, dtype=self.vae.dtype)
-        source_latent = self.vae.encode(source).latent * self.vae.config.scaling_factor
+        # --- Per-view source latents (replicated across CFG conditions) ---
+        source_latents_list: List[torch.Tensor] = []
+        for name, latent_size in zip(self.view_names, view_latent_sizes):
+            transform = v2.Compose([
+                v2.Resize((latent_size[0] * f, latent_size[1] * f)),
+                v2.ToImage(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize([0.5], [0.5]),
+            ])
+            src = transform(per_view_pil[name]).unsqueeze(0).to(device, dtype=self.vae.dtype)
+            src_lat = self.vae.encode(src).latent * self.vae.config.scaling_factor
 
-        if do_image_cfg:
-            black_latent = self.vae.encode(torch.zeros_like(source)).latent * self.vae.config.scaling_factor
-            source_latents = torch.cat([black_latent, source_latent, source_latent])
-        else:
-            source_latents = source_latent.repeat(2, 1, 1, 1)
-        source_latents = source_latents.repeat_interleave(num_images_per_prompt, dim=0)
+            if do_image_cfg:
+                black_lat = (
+                    self.vae.encode(torch.zeros_like(src)).latent
+                    * self.vae.config.scaling_factor
+                )
+                src_lat = torch.cat([black_lat, src_lat, src_lat])
+            else:
+                src_lat = src_lat.repeat(2, 1, 1, 1)
+            src_lat = src_lat.repeat_interleave(num_images_per_prompt, dim=0)
+            source_latents_list.append(src_lat)
 
-        # --- Initial noise ---
-        latents = randn_tensor(
-            shape=(num_images_per_prompt, self.config.in_channels, latent_size[0], latent_size[1]),
-            generator=generator, device=device, dtype=torch.float32,
-        )
+        # --- Initial noise per view ---
+        latents_list: List[torch.Tensor] = [
+            randn_tensor(
+                shape=(num_images_per_prompt, self.config.in_channels, h, w),
+                generator=generator, device=device, dtype=torch.float32,
+            )
+            for (h, w) in view_latent_sizes
+        ]
 
-        # --- Scheduler ---
-        if isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler):
-            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-            self.scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
-        else:
-            self.scheduler.set_timesteps(num_inference_steps)
+        # One scheduler instance per view — DPMSolverMultistepScheduler keeps
+        # an internal history of previous model outputs, and interleaving
+        # `step` calls for different views on a shared scheduler would
+        # corrupt that state.
+        schedulers = [copy.deepcopy(self.scheduler) for _ in self.view_names]
+        for sch in schedulers:
+            if isinstance(sch, FlowMatchEulerDiscreteScheduler):
+                sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+                sch.set_timesteps(num_inference_steps, sigmas=sigmas)
+            else:
+                sch.set_timesteps(num_inference_steps)
 
-        # --- Denoising loop ---
         n_cond = len(captions)
-        for t in tqdm(self.scheduler.timesteps, desc="Sampling", disable=not enable_progress_bar):
-            latent_input = latents.repeat(n_cond, 1, 1, 1).to(prompt_embeds.dtype)
-            if hasattr(self.scheduler, "scale_model_input"):
-                latent_input = self.scheduler.scale_model_input(latent_input, t)
+        view_ids = [self.view_to_id[n] for n in self.view_names]
 
-            noise_pred = self.transformer(
-                hidden_states=latent_input,
-                source_hidden_states=source_latents.to(prompt_embeds.dtype),
-                timestep=t.unsqueeze(0).expand(latent_input.shape[0]).to(device),
+        for t in tqdm(schedulers[0].timesteps, desc="Sampling", disable=not enable_progress_bar):
+            latent_inputs = []
+            for lat in latents_list:
+                lat_in = lat.repeat(n_cond, 1, 1, 1).to(prompt_embeds.dtype)
+                if hasattr(self.scheduler, "scale_model_input"):
+                    lat_in = self.scheduler.scale_model_input(lat_in, t)
+                latent_inputs.append(lat_in)
+
+            noise_preds = self.transformer(
+                hidden_states=latent_inputs,
+                source_hidden_states=[s.to(prompt_embeds.dtype) for s in source_latents_list],
+                view_ids=view_ids,
+                view_embedding=self.view_embedding,
+                timestep=t.unsqueeze(0).expand(latent_inputs[0].shape[0]).to(device),
                 encoder_hidden_states=prompt_embeds,
                 encoder_attention_mask=attention_mask,
             ).sample
+            if torch.is_tensor(noise_preds):
+                noise_preds = [noise_preds]
 
-            if do_image_cfg:
-                pred_uncond, pred_image, pred_full = noise_pred.chunk(3)
-                noise_pred = (
-                    pred_uncond
-                    + image_guidance_scale * (pred_image - pred_uncond)
-                    + guidance_scale * (pred_full - pred_image)
+            new_latents_list = []
+            for lat, noise_pred, sch in zip(latents_list, noise_preds, schedulers):
+                if do_image_cfg:
+                    pred_uncond, pred_image, pred_full = noise_pred.chunk(3)
+                    combined = (
+                        pred_uncond
+                        + image_guidance_scale * (pred_image - pred_uncond)
+                        + guidance_scale * (pred_full - pred_image)
+                    )
+                else:
+                    pred_uncond, pred_full = noise_pred.chunk(2)
+                    combined = pred_uncond + guidance_scale * (pred_full - pred_uncond)
+                new_latents_list.append(
+                    sch.step(combined, t, lat).prev_sample
                 )
-            else:
-                pred_uncond, pred_full = noise_pred.chunk(2)
-                noise_pred = pred_uncond + guidance_scale * (pred_full - pred_uncond)
+            latents_list = new_latents_list
 
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-
-        return self.decode_latents(
-            latents.to(self.vae.dtype) if self.vae is not None else latents,
-            return_tensor=return_tensor,
-        )
+        outputs: dict = {}
+        for name, lat in zip(self.view_names, latents_list):
+            outputs[name] = self.decode_latents(
+                lat.to(self.vae.dtype) if self.vae is not None else lat,
+                return_tensor=return_tensor,
+            )
+        return outputs

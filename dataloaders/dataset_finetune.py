@@ -17,13 +17,16 @@ class ImagePairDataset(Dataset):
     def __init__(
         self,
         root: str | Path,
-        camera_key: str = "observation.images.head_left_rgb",
+        camera_keys: Dict[str, str] | None = None,
         tolerance_s: float = 1e-4,
         video_backend: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.root = Path(root)
-        self.camera_key = camera_key
+        if camera_keys is None:
+            camera_keys = {"primary": "observation.images.head_left_rgb"}
+        self.camera_keys: Dict[str, str] = dict(camera_keys)
+        self.view_names: List[str] = list(self.camera_keys.keys())
         self.tolerance_s = tolerance_s
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         print(f"video_backend: {self.video_backend}")
@@ -44,15 +47,18 @@ class ImagePairDataset(Dataset):
         self.video_path_template: Optional[str] = self.info.get("video_path")
         self.features: Dict[str, Dict[str, Any]] = self.info.get("features", {})
 
-        # Validate camera key
-        if self.camera_key not in self.features:
-            raise KeyError(
-                f"Camera key '{self.camera_key}' not found in features. Available: {list(self.features.keys())}"
-            )
-        if self.features[self.camera_key].get("dtype") != "video":
-            raise ValueError(
-                f"Camera key '{self.camera_key}' is not stored as video. dtype={self.features[self.camera_key].get('dtype')}"
-            )
+        # Validate every camera key
+        for view_name, camera_key in self.camera_keys.items():
+            if camera_key not in self.features:
+                raise KeyError(
+                    f"Camera key '{camera_key}' (view '{view_name}') not found in features. "
+                    f"Available: {list(self.features.keys())}"
+                )
+            if self.features[camera_key].get("dtype") != "video":
+                raise ValueError(
+                    f"Camera key '{camera_key}' (view '{view_name}') is not stored as video. "
+                    f"dtype={self.features[camera_key].get('dtype')}"
+                )
 
         # Load episodes list
         self._episodes: List[Dict[str, Any]] = []
@@ -83,14 +89,14 @@ class ImagePairDataset(Dataset):
     def _episode_chunk(self, episode_index: int) -> int:
         return episode_index // self.chunks_size
 
-    def _video_path_for_episode(self, episode_index: int) -> Path:
+    def _video_path_for_episode(self, episode_index: int, camera_key: str) -> Path:
         if not self.video_path_template:
             chunk = self._episode_chunk(episode_index)
-            rel = f"videos/chunk-{chunk:03d}/{self.camera_key}/episode_{episode_index:06d}.mp4"
+            rel = f"videos/chunk-{chunk:03d}/{camera_key}/episode_{episode_index:06d}.mp4"
             return self.root / rel
         fpath = self.video_path_template.format(
             episode_chunk=self._episode_chunk(episode_index),
-            video_key=self.camera_key,
+            video_key=camera_key,
             episode_index=episode_index,
         )
         return self.root / fpath
@@ -117,11 +123,8 @@ class ImagePairDataset(Dataset):
 
         ts_source = local_fi / float(self.fps)
         # Always use the last frame as the target frame
-        target_fi = ep_len - 1 
+        target_fi = ep_len - 1
         ts_target = target_fi / float(self.fps)
-
-        video_path = self._video_path_for_episode(episode_index)
-        source_img, target_img = self._decode_pair(video_path, ts_source, ts_target)
 
         tasks = ep.get("tasks", [])
         if isinstance(tasks, list):
@@ -130,40 +133,61 @@ class ImagePairDataset(Dataset):
             caption = str(tasks)
 
         to_pil = v2.ToPILImage()
+        out: Dict[str, Any] = {"caption": caption}
+        for view_name, camera_key in self.camera_keys.items():
+            video_path = self._video_path_for_episode(episode_index, camera_key)
+            src_img, tgt_img = self._decode_pair(video_path, ts_source, ts_target)
+            out[f"source_image_{view_name}"] = to_pil(src_img)
+            out[f"target_image_{view_name}"] = to_pil(tgt_img)
 
-        return {
-            "source_image": to_pil(source_img),
-            "target_image": to_pil(target_img),
-            "caption": caption,
-        }
+        return out
 
 
-def _collate_fn_imagepair(batch, tokenize_func, tokenizer, source_transform, target_transform):
+def _collate_fn_imagepair(
+    batch,
+    tokenize_func,
+    tokenizer,
+    view_names: List[str],
+    source_transforms: Dict[str, Any],
+    target_transforms: Dict[str, Any],
+):
     captions = [example["caption"] for example in batch]
-    source_images = [example["source_image"] for example in batch]
-    target_images = [example["target_image"] for example in batch]
 
-    rand_probs = torch.rand((len(source_images), 1))
+    batch_size = len(batch)
+    rand_probs = torch.rand((batch_size, 1))
     null_caption_mask = rand_probs < 0.2
+    # Same image-drop decision for every view of the same sample, so the
+    # model never sees mismatched "null-source-view-A but real-source-view-B".
     null_image_mask = (rand_probs >= 0.1) & (rand_probs < 0.3)
 
     captions = [
         caption if not null_caption_mask[i] else ""
         for i, caption in enumerate(captions)
     ]
-    source_images = [
-        (
-            Image.new("RGB", (image.width, image.height))
-            if (image is not None and null_image_mask[i])
-            else image
-        )
-        for i, image in enumerate(source_images)
-    ]
 
-    sources = [source_transform(image) for image in source_images]
-    targets = [target_transform(image) for image in target_images]
+    return_dict: Dict[str, torch.Tensor] = {}
+    for view_name in view_names:
+        src_key = f"source_image_{view_name}"
+        tgt_key = f"target_image_{view_name}"
+        src_transform = source_transforms[view_name]
+        tgt_transform = target_transforms[view_name]
 
-    return_dict = {"source": torch.stack(sources), "target": torch.stack(targets)}
+        source_images = [example[src_key] for example in batch]
+        target_images = [example[tgt_key] for example in batch]
+        source_images = [
+            (
+                Image.new("RGB", (image.width, image.height))
+                if (image is not None and null_image_mask[i])
+                else image
+            )
+            for i, image in enumerate(source_images)
+        ]
+
+        sources = [src_transform(image) for image in source_images]
+        targets = [tgt_transform(image) for image in target_images]
+        return_dict[f"source_{view_name}"] = torch.stack(sources)
+        return_dict[f"target_{view_name}"] = torch.stack(targets)
+
     (
         return_dict["input_ids"],
         return_dict["attention_mask"],
@@ -172,11 +196,11 @@ def _collate_fn_imagepair(batch, tokenize_func, tokenizer, source_transform, tar
     return return_dict
 
 
-def _load_single_dataset(repo_id, root, camera_key):
+def _load_single_dataset(repo_id, root, camera_keys):
     try:
         dataset = ImagePairDataset(
             root=root,
-            camera_key=camera_key,
+            camera_keys=camera_keys,
         )
         print(f"✓ Loaded dataset: {repo_id}")
         return repo_id, dataset
@@ -185,67 +209,68 @@ def _load_single_dataset(repo_id, root, camera_key):
         return repo_id, None
 
 
+def _build_view_transform(size):
+    return v2.Compose(
+        [
+            v2.Resize(size),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize([0.5], [0.5]),
+        ]
+    )
+
+
 def get_train_datasets(data_args, tokenize_func, tokenizer):
     train_datasets = {}
-    
+
+    views = data_args.views
+    view_names: List[str] = [v["name"] for v in views]
+    camera_keys: Dict[str, str] = {v["name"]: v["key"] for v in views}
+    view_sizes: Dict[str, Tuple[int, int]] = {v["name"]: tuple(v["size"]) for v in views}
+
     # Prepare dataset loading tasks
     dataset_tasks = []
-    
+
     import os
     data_path = data_args.data_path
-    camera_key = data_args.camera_key
     for dir in os.listdir(data_path):
         if os.path.isdir(os.path.join(data_path, dir)):
             dataset_tasks.append((
                 dir,
                 os.path.join(data_path, dir),
-                camera_key,
+                camera_keys,
             ))
     # Load datasets in parallel using ThreadPoolExecutor
     print(f"Loading {len(dataset_tasks)} datasets in parallel...")
     start_time = time.time()
-    
+
     with ThreadPoolExecutor(max_workers=min(32, len(dataset_tasks))) as executor:
         # Submit all tasks
         future_to_task = {
-            executor.submit(_load_single_dataset, repo_id, root, camera_key): (repo_id, root, camera_key)
-            for repo_id, root, camera_key in dataset_tasks
+            executor.submit(_load_single_dataset, repo_id, root, ck): (repo_id, root, ck)
+            for repo_id, root, ck in dataset_tasks
         }
-        
+
         # Collect results as they complete
         for future in as_completed(future_to_task):
             repo_id, dataset = future.result()
             if dataset is not None:
                 train_datasets[repo_id] = dataset
-    
+
     elapsed_time = time.time() - start_time
     print(f"Loaded {len(train_datasets)}/{len(dataset_tasks)} datasets in {elapsed_time:.2f} seconds")
 
-    source_transform = v2.Compose(
-        [
-            v2.Resize(data_args.target_image_size),
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize([0.5], [0.5]),
-        ]
-    )
-    
-    target_transform = v2.Compose(
-        [
-            v2.Resize(data_args.target_image_size),
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize([0.5], [0.5]),
-        ]
-    )
+    source_transforms = {name: _build_view_transform(view_sizes[name]) for name in view_names}
+    target_transforms = {name: _build_view_transform(view_sizes[name]) for name in view_names}
 
     # Use a custom collate function for the torch Dataset
     collate_fn = partial(
         _collate_fn_imagepair,
         tokenize_func=tokenize_func,
         tokenizer=tokenizer,
-        source_transform=source_transform,
-        target_transform=target_transform,
+        view_names=view_names,
+        source_transforms=source_transforms,
+        target_transforms=target_transforms,
     )
 
     train_dataset = ConcatDataset(list(train_datasets.values()))
