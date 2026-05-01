@@ -3,6 +3,13 @@
 ### [Paper](http://arxiv.org/abs/2602.12322) | [Model](https://huggingface.co/mit-han-lab/foreact-pretrained) | [Real-World Data](https://huggingface.co/datasets/mit-han-lab/ForeActDataset)
 
 
+## News
+
+- \[2026/04\] 🔥 We make a [coffee making demo](#demo).
+- \[2026/04\] 🔥 We support multi-view visual foresight generation with per-view customizable resolution.
+- \[2026/02\] We release the code and model for ForeAct!
+
+
 ## About
 
 - ForeAct is a **visual foresight planner** that empowers VLAs with the ability to **anticipate future observations**, enabling more informed decision-making.
@@ -15,6 +22,8 @@
 
 
 ## Demo
+
+[![Watch the video](assets/coffee-demo-first-frame.png)](https://www.youtube.com/watch?v=rKdaN5hNqUs)
 
 [![Watch the video](assets/demo-first-frame.png)](https://www.youtube.com/watch?v=D7fZT01Kd1A)
 
@@ -31,19 +40,29 @@ bash environment_setup.sh foreact
 
 ### Finetune
 
-Download the [pretrained weights](https://huggingface.co/mit-han-lab/foreact-pretrained) and prepare your own real-world data (or use our processed [real-world data](https://huggingface.co/datasets/mit-han-lab/ForeActDataset)). Update the relevant paths in `configs/finetune.yaml`, then launch:
+Download the [pretrained weights](https://huggingface.co/mit-han-lab/foreact-pretrained) and prepare your own real-world data (or use our processed [real-world data](https://huggingface.co/datasets/mit-han-lab/ForeActDataset)). Update the relevant paths in the config you want to run (`configs/finetune.yaml` for single-view, `configs/finetune_multiview.yaml` for multi-view), then launch:
 
 ```bash
-bash scripts/run_finetune.sh
+### Single-view
+bash scripts/run_finetune.sh finetune.yaml
+
+### Multi-view
+bash scripts/run_finetune.sh finetune_multiview.yaml
 ```
 
 ### Inference
 
-```bash 
-### CLI
-python app_cli.py --checkpoint_path path/to/model --prompt "" --input_image path/to/image  --output_dir ./results
+```bash
+### CLI (single-view)
+python app_cli.py --checkpoint_path path/to/model --prompt "" \
+    --input_image primary=path/to/image --output_dir ./results
 
-### Gradio
+### CLI (multi-view)
+python app_cli.py --checkpoint_path path/to/model --prompt "" \
+    --input_image primary=path/to/img1 wrist_left=path/to/img2 wrist_right=path/to/img3 \
+    --output_dir ./results
+
+### Gradio (auto-adapts to the checkpoint's view configuration)
 python app.py --checkpoint_path path/to/model
 ```
 
